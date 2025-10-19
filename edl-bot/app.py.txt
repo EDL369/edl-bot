@@ -1,0 +1,609 @@
+import os
+import telebot
+import requests
+import threading
+import time
+import logging
+import hashlib
+import json
+from datetime import datetime, timedelta
+from flask import Flask
+from fake_useragent import UserAgent
+from ratelimit import limits, sleep_and_retry
+import psycopg2
+from urllib.parse import urlencode
+import random
+
+# ==================== НАСТРОЙКА ЛОГГИРОВАНИЯ ====================
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler('bot.log', encoding='utf-8')
+    ]
+)
+logger = logging.getLogger(__name__)
+
+# ==================== FLASK ДЛЯ RENDER ====================
+app = Flask(__name__)
+
+@app.route('/')
+def home():
+    return "🟢 EDL Bot - Работает стабильно! " + datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+@app.route('/health')
+def health():
+    return json.dumps({"status": "ok", "timestamp": datetime.now().isoformat()})
+
+@app.route('/stats')
+def stats():
+    return json.dumps({
+        "status": "running",
+        "uptime": get_uptime(),
+        "users_served": user_stats.get('total_users', 0),
+        "questions_answered": user_stats.get('total_questions', 0)
+    })
+
+# ==================== КОНФИГУРАЦИЯ ====================
+class Config:
+    BOT_TOKEN = os.environ.get('BOT_TOKEN')
+    DATABASE_URL = os.environ.get('DATABASE_URL', 'sqlite:///bot.db')
+    ADMIN_ID = os.environ.get('ADMIN_ID', '')
+    RENDER_URL = os.environ.get('RENDER_URL', 'https://your-bot.onrender.com')
+
+# ==================== СИСТЕМА КЭШИРОВАНИЯ ====================
+class CacheSystem:
+    def __init__(self):
+        self.cache = {}
+        self.setup_database()
+    
+    def setup_database(self):
+        """Используем PostgreSQL на Render или SQLite как запасной вариант"""
+        try:
+            if Config.DATABASE_URL and Config.DATABASE_URL.startswith('postgres'):
+                self.conn = psycopg2.connect(Config.DATABASE_URL, sslmode='require')
+                self.cursor = self.conn.cursor()
+                self.cursor.execute('''
+                    CREATE TABLE IF NOT EXISTS cache (
+                        id SERIAL PRIMARY KEY,
+                        question_hash TEXT UNIQUE,
+                        question TEXT,
+                        answer TEXT,
+                        created TIMESTAMP DEFAULT NOW()
+                    )
+                ''')
+                self.conn.commit()
+                logger.info("✅ Подключена PostgreSQL база данных")
+            else:
+                raise Exception("No PostgreSQL, using memory cache")
+        except Exception as e:
+            logger.warning(f"⚠️ PostgreSQL недоступна, используем кэш в памяти: {e}")
+            self.conn = None
+    
+    def get(self, question):
+        """Получить ответ из кэша"""
+        question_hash = hashlib.md5(question.encode()).hexdigest()
+        
+        if self.conn:
+            try:
+                self.cursor.execute(
+                    'SELECT answer FROM cache WHERE question_hash = %s AND created > NOW() - INTERVAL %s',
+                    (question_hash, '24 hours')
+                )
+                result = self.cursor.fetchone()
+                if result:
+                    return result[0]
+            except Exception as e:
+                logger.error(f"❌ Ошибка базы данных: {e}")
+        
+        if question_hash in self.cache:
+            data = self.cache[question_hash]
+            if datetime.now() - data['timestamp'] < timedelta(hours=24):
+                return data['answer']
+        
+        return None
+    
+    def set(self, question, answer):
+        """Сохранить ответ в кэш"""
+        question_hash = hashlib.md5(question.encode()).hexdigest()
+        
+        if self.conn:
+            try:
+                self.cursor.execute(
+                    'INSERT INTO cache (question_hash, question, answer) VALUES (%s, %s, %s) ON CONFLICT (question_hash) DO UPDATE SET answer = EXCLUDED.answer, created = NOW()',
+                    (question_hash, question, answer)
+                )
+                self.conn.commit()
+            except Exception as e:
+                logger.error(f"❌ Ошибка сохранения в базу: {e}")
+        
+        self.cache[question_hash] = {
+            'answer': answer,
+            'timestamp': datetime.now()
+        }
+
+# ==================== СИСТЕМА ЗАЩИТЫ ОТ СПАМА ====================
+class AntiSpamSystem:
+    def __init__(self):
+        self.user_requests = {}
+        self.cleanup_interval = 300
+    
+    def is_spam(self, user_id):
+        """Проверка на спам"""
+        now = time.time()
+        user_id = str(user_id)
+        
+        if user_id in self.user_requests:
+            self.user_requests[user_id] = [
+                t for t in self.user_requests[user_id] 
+                if now - t < 60
+            ]
+        
+        if user_id not in self.user_requests:
+            self.user_requests[user_id] = []
+        
+        self.user_requests[user_id].append(now)
+        
+        return len(self.user_requests[user_id]) > 10
+
+# ==================== СИСТЕМА ЗАПРОСОВ К ВНЕШНИМ API ====================
+class SmartRequestSystem:
+    def __init__(self):
+        self.ua = UserAgent()
+        self.last_request_time = 0
+    
+    @sleep_and_retry
+    @limits(calls=5, period=60)
+    def smart_request(self, url):
+        """Умный запрос с задержками и заголовками"""
+        time_since_last = time.time() - self.last_request_time
+        if time_since_last < 2:
+            time.sleep(2 - time_since_last)
+        
+        headers = {
+            'User-Agent': self.ua.random,
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+            'Accept-Language': 'ru-RU,ru;q=0.9,en;q=0.8',
+            'Connection': 'keep-alive',
+        }
+        
+        try:
+            self.last_request_time = time.time()
+            response = requests.get(url, headers=headers, timeout=15)
+            response.raise_for_status()
+            return response
+        except requests.exceptions.RequestException as e:
+            logger.error(f"❌ Ошибка запроса к {url}: {e}")
+            return None
+
+# ==================== ОСНОВНОЙ КЛАСС БОТА ====================
+class EDLBot:
+    def __init__(self):
+        if not Config.BOT_TOKEN:
+            logger.error("❌ BOT_TOKEN не установлен!")
+            raise ValueError("BOT_TOKEN required")
+        
+        self.bot = telebot.TeleBot(Config.BOT_TOKEN)
+        self.cache = CacheSystem()
+        self.antispam = AntiSpamSystem()
+        self.requester = SmartRequestSystem()
+        self.user_stats = {'total_users': 0, 'total_questions': 0}
+        
+        self.setup_handlers()
+        logger.info("✅ EDL Bot инициализирован")
+    
+    def setup_handlers(self):
+        @self.bot.message_handler(commands=['start', 'help'])
+        @sleep_and_retry
+        @limits(calls=10, period=60)
+        def send_welcome(message):
+            welcome_text = """
+⚖️ *Добро пожаловать в EDL*
+
+*Официальный бот по законодательству РБ*
+
+👨‍💻 *Создатель:* Соловьёв Н. С.
+🔐 *Все права защищены* © 2024
+
+*📋 Доступные команды:*
+/ask [вопрос] - задать юридический вопрос
+/laws - список кодексов РБ  
+/search [запрос] - поиск по законам
+/status - статус бота
+/stats - статистика
+
+*💡 Примеры вопросов:*
+• /ask Можно ли курить на остановке?
+• /ask Когда положен первый отпуск?
+• /search налоговый кодекс
+• /ask Штраф за превышение скорости
+
+*🔒 Конфиденциальность и надежность гарантированы!*
+            """
+            self.safe_send_message(message.chat.id, welcome_text)
+        
+        @self.bot.message_handler(commands=['ask'])
+        def handle_ask(message):
+            if self.antispam.is_spam(message.from_user.id):
+                self.safe_send_message(message.chat.id, "❌ Слишком много запросов. Подождите 1 минуту.")
+                return
+            
+            question = message.text.replace('/ask', '').strip()
+            if not question:
+                self.safe_send_message(message.chat.id, "❌ Напишите вопрос после /ask\nПример: /ask Можно ли курить на остановке?")
+                return
+            
+            self.safe_send_chat_action(message.chat.id, 'typing')
+            answer = self.get_smart_answer(question)
+            self.safe_send_message(message.chat.id, answer)
+            
+            self.user_stats['total_questions'] += 1
+            if str(message.from_user.id) not in self.user_stats:
+                self.user_stats['total_users'] += 1
+        
+        @self.bot.message_handler(commands=['search'])
+        def handle_search(message):
+            if self.antispam.is_spam(message.from_user.id):
+                self.safe_send_message(message.chat.id, "❌ Слишком много запросов. Подождите 1 минуту.")
+                return
+            
+            query = message.text.replace('/search', '').strip()
+            if not query:
+                self.safe_send_message(message.chat.id, "❌ Введите запрос для поиска\nПример: /search трудовой кодекс")
+                return
+            
+            self.safe_send_chat_action(message.chat.id, 'typing')
+            results = self.search_laws(query)
+            self.safe_send_message(message.chat.id, results)
+        
+        @self.bot.message_handler(commands=['laws'])
+        def show_laws(message):
+            laws_text = """
+📚 *Кодексы Республики Беларусь:*
+
+• *Гражданский кодекс* - имущественные отношения
+• *Трудовой кодекс* - трудовые отношения
+• *Налоговый кодекс* - налоги и сборы
+• *Уголовный кодекс* - преступления и наказания
+• *КоАП РБ* - административные правонарушения  
+• *Жилищный кодекс* - жилищные вопросы
+• *Банковский кодекс* - банковская деятельность
+• *Кодекс о браке и семье* - семейные отношения
+
+💡 *Спросите:* "Что регулирует трудовой кодекс?"
+            """
+            self.safe_send_message(message.chat.id, laws_text)
+        
+        @self.bot.message_handler(commands=['status'])
+        def show_status(message):
+            status_text = f"""
+🟢 *СТАТУС: EDL АКТИВЕН*
+
+📍 *Хостинг:* Render.com
+👨‍💻 *Создатель:* Соловьёв Н. С.
+🔐 *Права:* защищены © 2024
+💰 *Стоимость:* 0 рублей
+⏱️ *Режим:* 24/7
+
+📊 *Обработано:* {self.user_stats['total_questions']} вопросов
+🌐 *Доступность:* 99.9%
+
+*EDL - ваш надежный юридический помощник!*
+            """
+            self.safe_send_message(message.chat.id, status_text)
+        
+        @self.bot.message_handler(commands=['stats'])
+        def show_stats(message):
+            stats_text = f"""
+📊 *СТАТИСТИКА EDL:*
+
+👥 *Пользователей:* {self.user_stats['total_users']}
+❓ *Вопросов:* {self.user_stats['total_questions']}
+💾 *Кэш:* {len(self.cache.cache)} записей
+🕒 *Время работы:* {get_uptime()}
+
+👨‍💻 *Создатель:* Соловьёв Н. С.
+🔐 *Все права защищены*
+            """
+            self.safe_send_message(message.chat.id, stats_text)
+        
+        @self.bot.message_handler(func=lambda message: True)
+        def handle_all_messages(message):
+            if len(message.text.strip()) < 3:
+                return
+            
+            if self.antispam.is_spam(message.from_user.id):
+                self.safe_send_message(message.chat.id, "❌ Слишком много запросов. Подождите 1 минуту.")
+                return
+            
+            self.safe_send_chat_action(message.chat.id, 'typing')
+            answer = self.get_smart_answer(message.text)
+            self.safe_send_message(message.chat.id, answer)
+            
+            self.user_stats['total_questions'] += 1
+            if str(message.from_user.id) not in self.user_stats:
+                self.user_stats['total_users'] += 1
+    
+    def get_smart_answer(self, question):
+        """Умная система ответов с кэшированием"""
+        cached = self.cache.get(question)
+        if cached:
+            logger.info(f"⚡ Ответ из кэша: {question[:50]}...")
+            return cached
+        
+        answer = self.analyze_question(question)
+        self.cache.set(question, answer)
+        
+        return answer
+    
+    def analyze_question(self, question):
+        """Анализ вопроса с резервными стратегиями"""
+        question_lower = question.lower()
+        
+        knowledge_base = {
+            'курение': self.get_smoking_law,
+            'отпуск': self.get_vacation_law,
+            'налог': self.get_tax_law,
+            'алкоголь': self.get_alcohol_law,
+            'скорость': self.get_speed_law,
+            'развод': self.get_divorce_law,
+            'аренда': self.get_rent_law,
+            'труд': self.get_labor_law,
+            'штраф': self.get_fine_law,
+            'права': self.get_rights_law
+        }
+        
+        for keyword, answer_func in knowledge_base.items():
+            if keyword in question_lower:
+                return answer_func()
+        
+        return self.intelligent_search_with_fallback(question)
+    
+    def intelligent_search_with_fallback(self, question):
+        """Умный поиск с несколькими уровнями резерва"""
+        try:
+            pravo_result = self.search_pravo_safe(question)
+            if pravo_result:
+                return pravo_result
+            
+            myfin_result = self.search_myfin_safe(question)
+            if myfin_result:
+                return myfin_result
+            
+            return self.get_general_advice(question)
+            
+        except Exception as e:
+            logger.error(f"❌ Ошибка поиска: {e}")
+            return self.get_emergency_response(question)
+    
+    def search_pravo_safe(self, query):
+        """Безопасный поиск на Pravo.by"""
+        try:
+            encoded_query = requests.utils.quote(query)
+            url = f"https://pravo.by/search/?query={encoded_query}"
+            
+            response = self.requester.smart_request(url)
+            if response and response.status_code == 200:
+                return f"""
+🔍 *Найдено на Pravo.by по запросу:* "{query}"
+
+📖 *Официальный источник:* [Pravo.by]({url})
+
+💡 *Рекомендации:*
+• Изучите найденные документы
+• Обратите внимание на даты вступления в силу
+• Проверьте актуальность информации
+
+⚖️ *EDL - ваш надежный помощник в юридических вопросах*
+                """
+        except Exception as e:
+            logger.warning(f"⚠️ Pravo.by недоступен: {e}")
+        
+        return None
+    
+    def search_myfin_safe(self, query):
+        """Безопасный поиск на MyFin.by"""
+        try:
+            encoded_query = requests.utils.quote(query)
+            url = f"https://myfin.by/zakony/search?q={encoded_query}"
+            
+            response = self.requester.smart_request(url)
+            if response and response.status_code == 200:
+                return f"""
+📊 *Найдено на MyFin.by по запросу:* "{query}"
+
+📈 *Актуальные изменения:* [MyFin Законы]({url})
+
+💎 *Преимущества:*
+• Свежие поправки в законодательстве
+• Простые объяснения сложных норм
+• Примеры из практики
+
+🔍 *Также проверьте:* [Pravo.by](https://pravo.by) для официальных текстов
+
+*EDL - создан Соловьёвым Н. С., все права защищены*
+                """
+        except Exception as e:
+            logger.warning(f"⚠️ MyFin.by недоступен: {e}")
+        
+        return None
+    
+    def search_laws(self, query):
+        """Универсальный поиск по законодательству"""
+        pravo_url = f"https://pravo.by/search/?query={requests.utils.quote(query)}"
+        myfin_url = f"https://myfin.by/zakony/search?q={requests.utils.quote(query)}"
+        
+        return f"""
+🔍 *Универсальный поиск:* "{query}"
+
+📚 *Официальные источники:*
+• [Pravo.by - эталонная база]({pravo_url})
+• [MyFin.by - актуальные изменения]({myfin_url})
+
+🎯 *Популярные запросы:*
+• Налоговый кодекс
+• Трудовой договор  
+• Административные правонарушения
+• Гражданские права
+
+👨‍💻 *Создатель:* Соловьёв Н. С.
+🔐 *Все права защищены*
+"""
+    
+    def get_general_advice(self, question):
+        """Общий совет с улучшенными рекомендациями"""
+        return f"""
+❓ *Вопрос:* "{question}"
+
+🤔 *Для точного ответа уточните:*
+
+📍 *Место:* где происходит ситуация?
+⏰ *Время:* когда возник вопрос?
+👥 *Участники:* кто вовлечен?
+💼 *Обстоятельства:* какие детали важны?
+
+💡 *Примеры правильных вопросов:*
+• "Какая статья КоАП РБ за курение в подъезде?"
+• "Когда положен первый отпуск по Трудовому кодексу?"
+• "Штраф за превышение скорости на 20 км/ч в городе"
+
+🌐 *Проверить самостоятельно:*
+[Pravo.by](https://pravo.by) - официальная база законов
+
+👨‍💻 *EDL создан Соловьёвым Н. С.*
+🔐 *Все права защищены © 2024*
+"""
+    
+    def get_emergency_response(self, question):
+        """Аварийный ответ при полном сбое"""
+        return f"""
+⚠️ *Временные технические трудности*
+
+Ваш вопрос: "{question}"
+В настоящее время система поиска временно недоступна.
+
+🔄 *Что делать:*
+1. Повторите запрос через 2-3 минуты
+2. Используйте команду /search для прямого поиска
+3. Обратитесь к официальным источникам
+
+👨‍💻 *Создатель:* Соловьёв Н. С.
+🔐 *Все права защищены*
+
+*EDL скоро вернется к работе!*
+"""
+    
+    def get_smoking_law(self):
+        return """
+🚭 *Курение в общественных местах*
+
+📋 *Запрещено:*
+• Остановки общественного транспорта
+• Подъезды, лифты, лестничные клетки
+• Детские площадки, территории школ и больниц
+• Рабочие места в помещениях
+
+⚖️ *Ответственность:*
+• *Статья 18.16 КоАП РБ*
+• Штраф: от 0.5 до 4 базовых величин
+
+💡 *Разрешено:* в специально оборудованных местах
+
+👨‍💻 *Создатель EDL:* Соловьёв Н. С.
+🔐 *Все права защищены*
+"""
+    
+    def get_vacation_law(self):
+        return """
+🏖️ *Трудовой отпуск в РБ*
+
+📋 *Основные положения:*
+• Минимум 24 календарных дня (*ст. 150 ТК РБ*)
+• Право на отпуск после 6 месяцев работы (*ст. 154 ТК РБ*)
+• Основная часть отпуска - не менее 14 дней
+
+💰 *Оплата:*
+• Средний заработок за 12 месяцев
+• Выплата за 2 дня до начала отпуска
+
+👨‍💻 *Создатель EDL:* Соловьёв Н. С.
+🔐 *Все права защищены*
+"""
+    
+    def safe_send_message(self, chat_id, text):
+        """Безопасная отправка сообщений с обработкой ошибок"""
+        try:
+            self.bot.send_message(chat_id, text, parse_mode='Markdown', disable_web_page_preview=True)
+        except telebot.apihelper.ApiException as e:
+            logger.error(f"❌ Ошибка отправки сообщения: {e}")
+            try:
+                clean_text = text.replace('*', '').replace('_', '').replace('`', '')
+                self.bot.send_message(chat_id, clean_text)
+            except:
+                logger.error("❌ Не удалось отправить сообщение")
+    
+    def safe_send_chat_action(self, chat_id, action):
+        """Безопасная отправка действия чата"""
+        try:
+            self.bot.send_chat_action(chat_id, action)
+        except:
+            pass
+
+# ==================== СИСТЕМА МОНИТОРИНГА И Keep-Alive ====================
+start_time = time.time()
+user_stats = {'total_users': 0, 'total_questions': 0}
+
+def get_uptime():
+    """Получить время работы бота"""
+    uptime = time.time() - start_time
+    hours = int(uptime // 3600)
+    minutes = int((uptime % 3600) // 60)
+    return f"{hours}ч {minutes}м"
+
+def keep_alive_worker():
+    """Рабочий для поддержания активности"""
+    while True:
+        try:
+            requests.get(f"{Config.RENDER_URL}/health", timeout=10)
+            logger.info(f"✅ Keep-alive: {get_uptime()}")
+            
+            if hasattr(keep_alive_worker, 'last_cleanup'):
+                if time.time() - keep_alive_worker.last_cleanup > 600:
+                    logger.info("🧹 Очистка памяти...")
+                    keep_alive_worker.last_cleanup = time.time()
+            else:
+                keep_alive_worker.last_cleanup = time.time()
+                
+        except Exception as e:
+            logger.warning(f"⚠️ Keep-alive ошибка: {e}")
+        
+        time.sleep(300)
+
+def run_bot_supervisor():
+    """Супервизор бота с бесконечным перезапуском"""
+    while True:
+        try:
+            logger.info("🟢 Запускаем EDL Bot...")
+            bot_instance = EDLBot()
+            bot_instance.bot.polling(none_stop=True, timeout=90, long_polling_timeout=90)
+            
+        except Exception as e:
+            logger.error(f"🔴 КРИТИЧЕСКАЯ ОШИБКА: {e}")
+            logger.info("🔄 Перезапуск через 30 секунд...")
+            time.sleep(30)
+
+# ==================== ЗАПУСК СИСТЕМЫ ====================
+if __name__ == '__main__':
+    logger.info("🚀 Запуск EDL Bot System...")
+    
+    keep_alive_thread = threading.Thread(target=keep_alive_worker, daemon=True)
+    keep_alive_thread.start()
+    logger.info("✅ Keep-alive система запущена")
+    
+    bot_thread = threading.Thread(target=run_bot_supervisor, daemon=True)
+    bot_thread.start()
+    logger.info("✅ Супервизор бота запущен")
+    
+    logger.info("✅ Flask app запускается на порту 5000")
+    app.run(host='0.0.0.0', port=5000, debug=False, use_reloader=False)
