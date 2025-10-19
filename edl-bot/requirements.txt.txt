@@ -1,8 +1,0 @@
-pyTelegramBotAPI==4.14.0
-requests==2.31.0
-flask==2.3.3
-python-dotenv==1.0.0
-fake-useragent==1.4.0
-psycopg2-binary==2.9.9
-aiohttp==3.9.1
-ratelimit==2.2.1
